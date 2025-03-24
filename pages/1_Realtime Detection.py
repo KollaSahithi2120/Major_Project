@@ -1,22 +1,22 @@
+import os
 import logging
-import queue
 from pathlib import Path
-from typing import List, NamedTuple
+from typing import NamedTuple
 
-import av
 import cv2
 import numpy as np
 import streamlit as st
-from streamlit_webrtc import WebRtcMode, webrtc_streamer
-
-# Deep learning framework
 from ultralytics import YOLO
+from PIL import Image
+from io import BytesIO
+import geocoder
+from geopy.geocoders import Nominatim
+from streamlit_js_eval import get_geolocation  # Fetch device's exact GPS location
 
 from sample_utils.download import download_file
-from sample_utils.get_STUNServer import getSTUNServer
 
 st.set_page_config(
-    page_title="Realtime Detection",
+    page_title="Image Detection",
     page_icon="📷",
     layout="centered",
     initial_sidebar_state="expanded"
@@ -31,12 +31,17 @@ MODEL_URL = "https://github.com/oracl4/RoadDamageDetection/raw/main/models/YOLOv
 MODEL_LOCAL_PATH = ROOT / "./models/YOLOv8_Small_RDD.pt"
 download_file(MODEL_URL, MODEL_LOCAL_PATH, expected_size=89569358)
 
-# STUN Server
-STUN_STRING = "stun:" + str(getSTUNServer())
-STUN_SERVER = [{"urls": [STUN_STRING]}]
+def get_location_name(latitude, longitude):
+    """Convert latitude and longitude to a readable address."""
+    geolocator = Nominatim(user_agent="geo_locator")
+    location = geolocator.reverse((latitude, longitude), exactly_one=True)
+    return location.address if location else "Unknown Location"
 
-# Session-specific caching
-# Load the model
+def show_alert(damage_type, latitude, longitude):
+    """Display an alert on the screen with the actual location name."""
+    location_name = get_location_name(latitude, longitude)
+    st.warning(f"⚠ **Alert: {damage_type} detected!**\n📍 **Location: {location_name}**")
+
 cache_key = "yolov8smallrdd"
 if cache_key in st.session_state:
     net = st.session_state[cache_key]
@@ -57,25 +62,31 @@ class Detection(NamedTuple):
     score: float
     box: np.ndarray
 
-st.title("Road Damage Detection - Realtime")
+st.title("Road Damage Detection - Image")
+st.write("Detect the road damage in using an Image input. Upload the image and start detecting. This section can be useful for examining baseline data.")
 
-st.write("Detect the road damage in realtime using USB Webcam. This can be useful for on-site monitoring with personel on the ground. Select the video input device and start the inference.")
+geolocation_data = get_geolocation()
+if geolocation_data:
+    user_lat = geolocation_data["coords"]["latitude"]
+    user_lon = geolocation_data["coords"]["longitude"]
+    st.success(f"📍 **Device GPS Location Acquired:** {user_lat}, {user_lon}")
+else:
+    st.error("⚠ Unable to fetch accurate GPS location. Please enable location services.")
 
-# NOTE: The callback will be called in another thread,
-#       so use a queue here for thread-safety to pass the data
-#       from inside to outside the callback.
-# TODO: A general-purpose shared state object may be more useful.
-result_queue: "queue.Queue[List[Detection]]" = queue.Queue()
+image_file = st.file_uploader("Upload Image", type=['png', 'jpg'])
 
-def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
-    
-    image = frame.to_ndarray(format="bgr24")
-    h_ori = image.shape[0]
-    w_ori = image.shape[1]
-    image_resized = cv2.resize(image, (640, 640), interpolation = cv2.INTER_AREA)
+score_threshold = st.slider("Confidence Threshold", min_value=0.0, max_value=1.0, value=0.5, step=0.05)
+st.write("Lower the threshold if there is no damage detected, and increase the threshold if there is false prediction.")
+
+if image_file is not None:
+    image = Image.open(image_file)
+    col1, col2 = st.columns(2)
+    _image = np.array(image)
+    h_ori = _image.shape[0]
+    w_ori = _image.shape[1]
+    image_resized = cv2.resize(_image, (640, 640), interpolation=cv2.INTER_AREA)
     results = net.predict(image_resized, conf=score_threshold)
     
-    # Save the results on the queue
     for result in results:
         boxes = result.boxes.cpu().numpy()
         detections = [
@@ -87,36 +98,31 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
             )
             for _box in boxes
         ]
-        result_queue.put(detections)
-
+        
     annotated_frame = results[0].plot()
-    _image = cv2.resize(annotated_frame, (w_ori, h_ori), interpolation = cv2.INTER_AREA)
+    _image_pred = cv2.resize(annotated_frame, (w_ori, h_ori), interpolation=cv2.INTER_AREA)
+    
+    with col1:
+        st.write("#### Image")
+        st.image(_image)
+    
+    with col2:
+        st.write("#### Predictions")
+        st.image(_image_pred)
+        
+        buffer = BytesIO()
+        _downloadImages = Image.fromarray(_image_pred)
+        _downloadImages.save(buffer, format="PNG")
+        _downloadImagesByte = buffer.getvalue()
 
-    return av.VideoFrame.from_ndarray(_image, format="bgr24")
-
-webrtc_ctx = webrtc_streamer(
-    key="road-damage-detection",
-    mode=WebRtcMode.SENDRECV,
-    rtc_configuration={"iceServers": STUN_SERVER},
-    video_frame_callback=video_frame_callback,
-    media_stream_constraints={
-        "video": {
-            "width": {"ideal": 1280, "min": 800},
-        },
-        "audio": False
-    },
-    async_processing=True,
-)
-
-score_threshold = st.slider("Confidence Threshold", min_value=0.0, max_value=1.0, value=0.5, step=0.05)
-
-st.write("Lower the threshold if there is no damage detected, and increase the threshold if there is false prediction.")
-
-st.divider()
-
-if st.checkbox("Show Predictions Table", value=False):
-    if webrtc_ctx.state.playing:
-        labels_placeholder = st.empty()
-        while True:
-            result = result_queue.get()
-            labels_placeholder.table(result)
+        st.download_button(
+            label="Download Prediction Image",
+            data=_downloadImagesByte,
+            file_name="RDD_Prediction.png",
+            mime="image/png"
+        )
+        
+        if detections and geolocation_data:
+            for detection in detections:
+                if detection.score > score_threshold:
+                    show_alert(detection.label, user_lat, user_lon)
